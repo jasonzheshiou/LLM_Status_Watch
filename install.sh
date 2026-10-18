@@ -50,6 +50,16 @@ case "${1:-help}" in
       echo "installed into $DST"
     fi
     chmod 600 "$DST/LLM_Status_Watch.conf"
+    # A config carried over from an earlier name keeps its old state_file/db_file lines,
+    # which silently splits the token ledger in two: the service writes one, you read the
+    # other, and nothing ever looks broken. Refuse rather than half-work.
+    if grep -E '^(state_file|db_file)[[:space:]]*=' "$DST/LLM_Status_Watch.conf" | grep -qv 'LLM_Status_Watch'; then
+      echo "install.sh: refusing to install - your config writes state outside the project dir:" >&2
+      grep -nE '^(state_file|db_file)[[:space:]]*=' "$DST/LLM_Status_Watch.conf" | sed 's/^/    /' >&2
+      echo "  fix it with:" >&2
+      echo "    sed -i 's#/.local/state/[^/]*/#/.local/state/LLM_Status_Watch/#' $DST/LLM_Status_Watch.conf" >&2
+      exit 1
+    fi
     $SUDO true 2>/dev/null || err "passwordless sudo unavailable; use the cron recipe in README.md"
     $SUDO install -m 644 "$SRC/$UNIT.service" "/etc/systemd/system/$UNIT.service" || err "unit copy failed"
     $SUDO systemctl daemon-reload            || err "daemon-reload failed"

@@ -272,4 +272,5 @@ ssh -F /dev/null jason@192.168.1.198 systemctl is-active LLM_Status_Watch
 | nothing at all in the log | not started, or wrong config path: `systemctl status LLM_Status_Watch` |
 | `no topic configured in [notify]` | topic missing from the config |
 | alert never comes | the current state is the baseline from first start; wait for a real busy→idle transition, or set `notify_on_startup_idle = true` |
+| two ledgers, or one looks empty | your config's `state_file`/`db_file` point at an older project dir; `install.sh` now refuses to install rather than split the ledger in two |
 | phone silent but `test-notify` says OK | app not subscribed to that exact topic, or battery optimisation killing it |
