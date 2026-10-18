@@ -1,0 +1,28 @@
+[Unit]
+Description=LLM server idle watcher (ntfy push)
+Documentation=file:/home/jason/LLM_Status_Watch/README.md
+Wants=network-online.target
+After=network-online.target
+# A persistent watcher should never be locked out by the burst counter: without these,
+# enough crashes inside the default 10 s window leaves it failed until someone logs in.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=jason
+ExecStart=/usr/bin/python3 /home/jason/LLM_Status_Watch/LLM_Status_Watch.py --config /home/jason/LLM_Status_Watch/LLM_Status_Watch.conf
+Environment=PYTHONUNBUFFERED=1
+# always, not on-failure: an unexpected exit 0 should still bring it back
+Restart=always
+RestartSec=15
+TimeoutStopSec=10
+SyslogIdentifier=LLM_Status_Watch
+# Light hardening only. ProtectHome is deliberately not used: the state file lives in
+# ~/.local/state and read-only home would break it.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

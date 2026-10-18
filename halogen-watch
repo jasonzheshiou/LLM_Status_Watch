@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Live monitor for the halogen-flash-server container.
+#
+#   ./halogen-watch           refresh every 5 s (Ctrl-C to quit)
+#   ./halogen-watch 2         refresh every 2 s
+#   ./halogen-watch --once    one snapshot, no loop - cron and ssh friendly
+#   NAME=halogen PORT=8080 ./halogen-watch
+#
+# Everything here reads 127.0.0.1, never localhost: this host resolves localhost
+# to ::1 first and the published port is IPv4-only, so a localhost poll fails
+# instantly and looks like a dead server.
+#
+# Memory is the number people get wrong. The engine mlocks 62 GiB of weights,
+# the kernel counts them as reclaimable page cache, and so:
+#   - `podman stats` reports ~700 MB  (charged outside the container's cgroup)
+#   - `free`/MemAvailable reports ~92 GiB available (it is not really available)
+# The honest reads are the page-cache figure, which is where the weights land,
+# and PSI memory pressure, which is what actually warns you before a stall.
+set -uo pipefail
+
+NAME="${NAME:-halogen}"
+PORT="${PORT:-8080}"
+BASE="http://127.0.0.1:${PORT}"
+
+ONCE=0 INTERVAL=5
+for a in "$@"; do
+  case $a in
+    --once)     ONCE=1 ;;
+    -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *[!0-9]*)   echo "usage: ${0##*/} [--once | refresh-seconds]" >&2; exit 2 ;;
+    *)          INTERVAL=$a ;;
+  esac
+done
+
+command -v podman >/dev/null || { echo "podman not installed"; exit 1; }
+
+M=""
+metrics() {
+  local body
+  for _ in 1 2 3; do                       # /metrics has been seen to return an
+    body=$(curl -s -m 4 "$BASE/metrics" 2>/dev/null)   # empty body as a request
+    [[ -n $body ]] && break                # finishes; retry before calling it 0
+    sleep 0.3
+  done
+  M=$(awk '
+    /^llamacpp:(requests_processing|requests_deferred|prompt_tokens_total|kv_cache_usage_ratio) / {print $1,$2}
+    /^llamacpp:(tokens_predicted_total|tokens_predicted_seconds_total) / {print $1,$2}
+    /^halogen:(requests_total|prompt_tokens_cached_total|draft_tokens_total|draft_tokens_accepted_total) / {print $1,$2}
+  ' <<<"$body")
+}
+mval() { awk -v k="$1" '$1==k{printf "%s",$2; exit}' <<<"$M"; }
+
+logs_grep() { podman logs --tail "$2" "$NAME" 2>&1 | grep -E "$1"; }
+status()    { podman ps -a --filter "name=^${NAME}$" --format '{{.Status}}' 2>/dev/null | head -1; }
+
+clients() {
+  ss -tn 2>/dev/null | awk -v p=":${PORT}\$" '$4 ~ p { peer=$5; sub(/:[0-9]+$/,"",peer); n[peer]++ }
+           END{ for (c in n) printf "%s(%d) ", c, n[c]; }'
+}
+
+pressure() { [[ -r /proc/pressure/memory ]] && awk '/^some/{for(i=1;i<=NF;i++) if($i~/avg10=/){split($i,a,"=");printf "%s",a[2];exit}}' /proc/pressure/memory || echo "n/a"; }
+
+memline() {
+  awk '
+    /^MemAvailable:/{a=$2} /^Cached:/{c=$2} /^SwapTotal:/{st=$2} /^SwapFree:/{sf=$2}
+    END{ printf "page cache %.1f GiB (the weights live here) | MemAvailable %.0f GiB (overstates) | swap used %.1f GiB",
+                c/1048576, a/1048576, (st-sf)/1048576 }' /proc/meminfo
+}
+
+prev_t=""; prev_s=""
+snapshot() {
+  local st proc defer toks secs ptoks reqs cached psi ratio
+  st=$(status)
+  if [[ -z $st ]]; then echo "halogen-watch: no container named '$NAME'. Start it with ./launch_qwen_halogen.sh"; return 1; fi
+  if [[ $st != Up* ]]; then
+    printf '%s\n' "halogen-watch: container is ${st} - it is NOT serving."
+    printf '%s\n' "  exit code: $(podman inspect "$NAME" --format '{{.State.ExitCode}}' 2>/dev/null)"
+    printf '%s\n' "  last lines of its log (the only account of the failure):"
+    podman logs --tail 12 "$NAME" 2>&1 | sed 's/^/    /'
+    printf '%s\n' "  then clear it:  podman rm $NAME"
+    return 1
+  fi
+
+  metrics
+  proc=$(mval llamacpp:requests_processing); defer=$(mval llamacpp:requests_deferred)
+  toks=$(mval llamacpp:tokens_predicted_total); secs=$(mval llamacpp:tokens_predicted_seconds_total)
+  ptoks=$(mval llamacpp:prompt_tokens_total); reqs=$(mval halogen:requests_total)
+  cached=$(mval halogen:prompt_tokens_cached_total); ratio=$(mval llamacpp:kv_cache_usage_ratio)
+  psi=$(pressure)
+
+  local speed="idle"
+  if [[ -n $prev_t && -n $prev_s ]]; then
+    speed=$(awk -v a="$prev_t" -v b="$toks" -v x="$prev_s" -v y="$secs" \
+            'BEGIN{ if (y>x && b>=a) printf "%.1f tok/s", (b-a)/(y-x); else printf "idle" }')
+  fi
+  prev_t=$toks; prev_s=$secs
+
+  local busy="idle"; (( ${proc:-0} > 0 )) && busy="GENERATING ($proc)"
+  (( ${defer:-0} > 0 )) && busy="$busy, $defer QUEUED"
+
+  printf 'halogen-watch  %s  %s  [%s]\n' "$(date +%H:%M:%S)" "$NAME" "$st"
+  printf '  state     %s | clients: %s\n' "$busy" "$(clients)none"
+  printf '  speed     %s   (lifetime %s decoded tok, %s prefill tok, %s requests)\n' \
+         "$speed" "${toks:-0}" "${ptoks:-0}" "${reqs:-0}"
+  printf '  kv pool   %.2f%% of positions in use | prompt tok reused %s\n' \
+         "$(awk -v r="${ratio:-0}" 'BEGIN{printf "%.2f", r*100}')" "${cached:-0}"
+  printf '  memory    %s | PSI %s\n' "$(memline)" "${psi:-n/a}"
+  local cur; cur=$(logs_grep '^flash_serve: req' 40 | tail -1)
+  [[ -n $cur ]] && printf '  recent    %s\n' "${cur#flash_serve: }"
+  local sum; sum=$(logs_grep '^serve_api: (mtp|serial)' 400 | tail -1)
+  [[ -n $sum ]] && printf '  last req  %s\n' "${sum#serve_api: }"
+
+  local w=()
+  (( ${defer:-0} > 0 )) && w+=("requests queued: one KV slot only (HALOGEN_KV_SLOTS) or a client is timing out")
+  grep -Eq "closed at [0-9]+ by answer room" <<<"${sum:-}" && w+=("thinking was truncated by the answer room - max_tokens under ~1024 effectively turns thinking off")
+  grep -q "no room for" <<<"$(logs_grep 'no room for' 400 || true)" && w+=("KV pool had to move held regions - prompts are near the pool limit")
+  local p; p=$(pressure)
+  awk -v v="${p:-0}" 'BEGIN{exit !(v>5)}' && w+=("MEMORY PRESSURE PSI=$p - the host is stalling, this is the failure mode, not an error")
+  local sw; sw=$(awk '/^SwapTotal/{t=$2}/^SwapFree/{f=$2}END{print (t-f)/1048576}' /proc/meminfo)
+  awk -v v="${sw:-0}" 'BEGIN{exit !(v>0.5)}' && w+=("swap in use (${sw} GiB) - unified memory is oversubscribed")
+  if (( ${#w[@]} )); then printf '  !! %s\n' "${w[@]}"; fi
+}
+
+if (( ONCE )); then snapshot; exit $?; fi
+while true; do
+  out=$(snapshot) || { printf '%s\n' "$out"; exit 1; }
+  printf '\033[H\033[2J%s\n' "$out"
+  sleep "$INTERVAL"
+done

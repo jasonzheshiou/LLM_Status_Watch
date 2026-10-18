@@ -1,0 +1,38 @@
+# Copy this file to LLM_Status_Watch.conf, then fill in the topic. Keep it 0600:
+# on the public ntfy.sh server the topic name IS the access control, so it is a secret
+# and this file is gitignored for a reason.
+
+[watcher]
+metrics_url         = http://192.168.1.59:8080/metrics
+poll_seconds        = 30
+# alert once idle has held this long (the idle test needs a previous sample, so
+# detection lands a poll later than this number)
+idle_after_minutes  = 5
+# after a reboot the LLM server may still be loading weights; stay quiet about "DOWN"
+# until it has answered once, or until this much time has passed
+startup_grace_minutes = 10
+fail_threshold      = 4
+http_timeout        = 8
+empty_body_retries  = 3
+state_file          = ~/.local/state/LLM_Status_Watch/state.json
+engine_up_counts_as_down = true
+
+[tokens]
+record         = true
+db_file        = ~/.local/state/LLM_Status_Watch/tokens.sqlite3
+flush_minutes  = 15
+
+[notify]
+method         = ntfy
+ntfy_server    = https://ntfy.sh
+topic          =
+server_label   = llm
+notify_idle    = true
+notify_down    = true
+notify_recovery = true
+notify_on_startup_idle = false
+idle_priority  = default
+down_priority  = high
+click_url      =
+dry_run        = false
+publish_timeout = 10

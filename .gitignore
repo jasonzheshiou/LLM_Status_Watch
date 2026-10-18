@@ -1,0 +1,17 @@
+# Your real config holds the ntfy topic, which on ntfy.sh is the only thing standing
+# between a stranger and your notification stream. Ship the .example, never the config.
+LLM_Status_Watch.conf
+
+# runtime state: created on the Pi, never source
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.state*
+.state-t.json
+.tokens-test.sqlite3*
+
+# scratch used while testing
+.t.conf
+.test.conf
+__pycache__/
+*.pyc
